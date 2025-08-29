@@ -19,6 +19,7 @@ Examples:
   python importer.py --preflight-only all-slack-import.csv
 """
 import argparse
+import glob
 import csv
 import json
 import os
@@ -278,13 +279,34 @@ def rows_from_json_file(infile: str, force_channel: str, chan_map: Dict[str, str
 
     return rows
 
+def expand_inputs(patterns):
+    """Expand *.json and **/*.json patterns and also allow directories."""
+    files = []
+    for pat in patterns:
+        if os.path.isdir(pat):
+            # take all JSONs under this dir, recursively
+            files.extend(glob.glob(os.path.join(pat, "**", "*.json"), recursive=True))
+            continue
+        hits = glob.glob(pat, recursive=True)
+        if hits:
+            files.extend(hits)
+        else:
+            # if it looks like a file path, keep it if it exists
+            if pat.lower().endswith(".json") and os.path.exists(pat):
+                files.append(pat)
+            else:
+                print(f"Warning: pattern matched no files: {pat}", file=sys.stderr)
+    return files
+
 # -----------------------------
 # CLI
 # -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert Discord JSON to a Slack-importable CSV with sanitization and preflight.")
-    ap.add_argument("inputs", nargs="+", help="Discord JSON files (or a single CSV with --preflight-only)")
+    ap = argparse.ArgumentParser(
+        description="Convert Discord JSON to a Slack-importable CSV with sanitization and preflight.")
+    ap.add_argument("inputs", nargs="+",
+                    help="Discord JSON files (patterns or dirs ok) OR a single CSV with --preflight-only")
     ap.add_argument("-o", "--outfile", default="discord-to-slack.csv", help="Output CSV path")
     ap.add_argument("--channel", help="Force all rows into this Slack channel name (e.g., general)")
     ap.add_argument("--channel-map", help="JSON or 2-col CSV: Discord channel_id -> Slack channel name")
@@ -293,22 +315,27 @@ def main():
 
     # Preflight-only mode
     if args.preflight_only:
-        if len(args.inputs) != 1 or not args.inputs[0].lower().endswith(".csv"):
-            print("In --preflight-only mode, pass exactly one CSV file.", file=sys.stderr)
+        expanded = expand_inputs(args.inputs)
+        if len(expanded) != 1 or not expanded[0].lower().endswith(".csv"):
+            print("In --preflight-only mode, pass exactly one CSV file (patterns/dirs allowed).", file=sys.stderr)
             return 2
-        issues = preflight_slack_csv(args.inputs[0])
-        print_preflight(issues, label=os.path.basename(args.inputs[0]))
+        issues = preflight_slack_csv(expanded[0])
+        print_preflight(issues, label=os.path.basename(expanded[0]))
         return 0
 
     chan_map = load_channel_map(args.channel_map) if args.channel_map else {}
+    file_args = expand_inputs(args.inputs)
+    # keep only .json
+    file_args = [p for p in file_args if p.lower().endswith(".json")]
+    if not file_args:
+        print("No JSON files found from inputs/patterns. Example: *.json or data/**/*.json", file=sys.stderr)
+        return 2
 
     # Build rows from all JSON inputs
-    all_rows: List[Tuple[int,str,str,str]] = []
-    for infile in args.inputs:
-        if infile.lower().endswith(".json"):
-            all_rows.extend(rows_from_json_file(infile, sanitize_channel(args.channel) if args.channel else "", chan_map))
-        else:
-            print(f"Skipping non-JSON input: {infile}", file=sys.stderr)
+    all_rows = []
+    forced_channel = sanitize_channel(args.channel) if args.channel else ""
+    for infile in file_args:
+        all_rows.extend(rows_from_json_file(infile, forced_channel, chan_map))
 
     # Sort ascending by timestamp
     all_rows.sort(key=lambda r: r[0])
@@ -324,11 +351,10 @@ def main():
     print_preflight(issues, label=os.path.basename(args.outfile))
 
     # Friendly summary
-    if issues["wrong_cols"] == issues["bad_ts"] == issues["unsorted"] == issues["bad_channel"] == issues["bad_username"] == 0:
+    if all(issues[k] == 0 for k in ("wrong_cols","bad_ts","unsorted","bad_channel","bad_username")):
         print(f"\n✅ Wrote {len(all_rows)} rows to {args.outfile} (looks Slack-ready).")
     else:
         print(f"\n⚠️  Wrote {len(all_rows)} rows to {args.outfile}, but preflight found issues above.")
-
     return 0
 
 if __name__ == "__main__":
